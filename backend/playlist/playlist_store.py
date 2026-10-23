@@ -61,10 +61,18 @@ class Playlist:
         self.position = 0.0
         self.position_at = time.time()
 
-    def set_position(self, p_id: int, position: float) -> bool:
+    def set_position(self, p_id: int, position: float, duration: float | None = None, too_long_after: float | None = None) -> bool:
         # The real position, reported by the YouTube window; ignored if it's about another song.
         if self.current_song is None or self.current_song.p_id != p_id:
             return False
+        # A song added without a length (nothing could look it up) gets its real one from the
+        # window once it plays, and is flagged if that's over the limit (it keeps playing). A
+        # known length is never changed. Logged, so a restored session keeps it.
+        if duration and not self.current_song.duration:
+            self.current_song.duration = float(duration)
+            if too_long_after is not None and duration > too_long_after:
+                self.current_song.is_too_long = True
+            self.renumber_and_log()
         if self.current_song.duration:
             position = min(position, self.current_song.duration)
         self.position = max(0.0, position)

@@ -10,7 +10,7 @@ import { useQueueSettings } from "../../../lib/use-queue-settings";
 import { fetchQueueFinished } from "../../../lib/use-playlist";
 import { fetchMainScreen } from "../../../lib/main-screen";
 import { fromSong, steerYouTubeWindow } from "../../../lib/youtube-window";
-import { describeWaits, formatLength, heldAtStart, songElapsed, stampClock, totalLength } from "../../../lib/queue-time";
+import { describeUnknownLengths, describeWaits, formatLength, heldAtStart, songElapsed, songLength, stampClock, totalLength } from "../../../lib/queue-time";
 import shared from "../admin.module.css";
 import styles from "./page.module.css";
 import { getErrorMessage, statusMessage } from "../../../lib/api-error";
@@ -281,13 +281,18 @@ export default function AdminPlaylist() {
     const remaining = currentIndex >= 0 ? songs.slice(currentIndex + (finished ? 1 : 0)) : songs;
     // Counts down while the song plays: the part of it already sung isn't left.
     const elapsed = currentIndex >= 0 && !finished ? songElapsed(playback, now) : 0;
-    const timeLeft = Math.max(0, totalLength(remaining) - elapsed);
+    // A song whose length is only a guess (3 min) counts down to 0, never below.
+    const timeLeft = Math.max(0, totalLength(remaining) - Math.min(elapsed, songLength(playback.song)));
     // With "Start each song paused", each song still to start waits first. The current song only
     // counts while it's held at the start (paused, not yet begun).
     const currentHeld = currentIndex >= 0 && !finished && heldAtStart(playback.playing, elapsed);
     const waitsLeft = remaining.filter((song) => song.p_id !== playback.song?.p_id || currentHeld).length;
     const timeLeftWaits = describeWaits(timeLeft, waitsLeft, queue);
     const wholeQueueWaits = describeWaits(totalLength(songs), songs.length, queue);
+    // Songs with no known length count as 3 min, which makes a total an estimate until they've
+    // been sung: marked with "~" and a line saying so.
+    const timeLeftUnknown = describeUnknownLengths(remaining);
+    const wholeQueueUnknown = describeUnknownLengths(songs);
 
     let playbackState = "Nothing is playing";
     if (finished) {
@@ -315,13 +320,15 @@ export default function AdminPlaylist() {
                         </div>
                         <div>
                             <dt>Time left</dt>
-                            <dd>{formatLength(timeLeft)}</dd>
+                            <dd>{timeLeftUnknown ? "~" : ""}{formatLength(timeLeft)}</dd>
                             {timeLeftWaits && <dd className={styles.statNote}>{timeLeftWaits}</dd>}
+                            {timeLeftUnknown && <dd className={styles.statNote}>{timeLeftUnknown}</dd>}
                         </div>
                         <div>
                             <dt>Whole queue</dt>
-                            <dd>{formatLength(totalLength(songs))}</dd>
+                            <dd>{wholeQueueUnknown ? "~" : ""}{formatLength(totalLength(songs))}</dd>
                             {wholeQueueWaits && <dd className={styles.statNote}>{wholeQueueWaits}</dd>}
+                            {wholeQueueUnknown && <dd className={styles.statNote}>{wholeQueueUnknown}</dd>}
                         </div>
                     </dl>
                     {mainScreen && (

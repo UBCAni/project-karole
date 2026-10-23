@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Karole YouTube Controller",
-  "version": "1.8.0",
+  "version": "1.8.3",
   "description": "Lets the Karole player page open YouTube in its own window and control what plays there.",
   "browser_specific_settings": {
     "gecko": {

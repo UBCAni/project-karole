@@ -257,7 +257,10 @@ function reportPosition(current) {
     const expected = last ? last.time + (last.state === "playing" ? ((now - last.at) / 1000) * (last.rate || 1) : 0) : null;
     lastPosition = { videoId: current.videoId, state: current.state, time: current.time, rate: current.rate, at: now };
     if (last && last.state === current.state && Math.abs(current.time - expected) < 2) return;
-    chrome.runtime.sendMessage({ from: "youtube", type: "position", pId: desired.pId, time: current.time }).catch(() => {});
+    // With the song's real length, which fills it in on the site for a song added without one.
+    chrome.runtime
+        .sendMessage({ from: "youtube", type: "position", pId: desired.pId, time: current.time, duration: current.duration })
+        .catch(() => {});
 }
 
 function tick() {

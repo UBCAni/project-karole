@@ -15,10 +15,13 @@ from playlist.playlist_store import playlist_store, list_sessions, read_snapshot
 from pydantic import ValidationError
 from database import client
 import asyncio
+import re
+import json
 import os
 import time
 from typing import Any, cast
 from html.parser import HTMLParser
+from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -48,7 +51,86 @@ prefetch_tasks: set[asyncio.Task] = set()
 
 def extract_video_info(url: str) -> dict:
     options = _yt_dlp_options()
+    # Adding a song only needs its title, length and channel, never a playable file. YouTube often
+    # hides the files from servers, which would otherwise fail the whole lookup.
+    options["ignore_no_formats_error"] = True
     return _extract_info_with_auth_fallback(url, options)
+
+class VideoNotFound(Exception):
+    """YouTube's API says there's no video with that ID (a mistyped link, or it was removed)."""
+
+
+class VideoAgeRestricted(Exception):
+    """YouTube's API says the video is age-restricted."""
+
+
+YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
+ISO_DURATION = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$")
+
+
+def parse_iso_duration(text: str | None) -> float | None:
+    # The API's lengths look like "PT4M13S" or "PT1H2M5S". Live streams say "P0D": no length.
+    match = ISO_DURATION.match(text or "")
+    if not match:
+        return None
+    days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    total = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+    return float(total) if total > 0 else None
+
+
+def lookup_with_api(video_id: str) -> dict | None:
+    # YouTube's official Data API, for when yt-dlp is refused (YouTube is much stricter with servers
+    # than with home connections, but not with its API). Needs YOUTUBE_API_KEY in backend/.env; one
+    # lookup uses 1 unit of the free 10,000 a day. Returns the same fields yt-dlp's lookup is read
+    # for, or None when there's no key or the API can't be reached. Raises VideoNotFound or
+    # VideoAgeRestricted when the API says so.
+    key = os.getenv("YOUTUBE_API_KEY")
+    if not key:
+        return None
+    query = urlencode({"part": "snippet,contentDetails", "id": video_id, "key": key})
+    try:
+        with urlopen(UrlRequest(f"{YOUTUBE_API_URL}?{query}"), timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):
+        # No answer, a bad key or the day's quota used up (the key is never logged).
+        return None
+    items = data.get("items") or []
+    if not items:
+        raise VideoNotFound(video_id)
+    snippet = items[0].get("snippet") or {}
+    details = items[0].get("contentDetails") or {}
+    if (details.get("contentRating") or {}).get("ytRating") == "ytAgeRestricted":
+        raise VideoAgeRestricted(video_id)
+    channel_id = snippet.get("channelId")
+    return {
+        "title": snippet.get("title"),
+        "uploader": snippet.get("channelTitle"),
+        "duration": parse_iso_duration(details.get("duration")),
+        "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else None,
+    }
+
+
+def lookup_video(url: str, video_id: str) -> dict:
+    # The details for a song being added, trying in turn: yt-dlp, yt-dlp again with the cookies file
+    # (YTDLP_COOKIE_FILE, only if set; both in extract_video_info), YouTube's Data API (only with
+    # YOUTUBE_API_KEY), and finally nothing: an empty dict, so the song is added with the name the
+    # singer typed as its title and no channel or length (the YouTube window plays it by its ID
+    # anyway). Raises DownloadError for a video that doesn't exist or is age-restricted.
+    try:
+        return extract_video_info(url)
+    except DownloadError as error:
+        # Age-restricted videos need a signed-in, age-verified account; nothing below helps.
+        if "confirm your age" in str(error):
+            raise
+        failure = error
+    try:
+        details = lookup_with_api(video_id)
+    except VideoNotFound:
+        raise failure from None
+    except VideoAgeRestricted:
+        raise DownloadError("ERROR: Sign in to confirm your age (YouTube Data API)") from None
+    return details or {}
+
 
 def extract_playback_url(url: str) -> str | None:
     options = _yt_dlp_options()
@@ -220,7 +302,7 @@ async def add_song(body: PlaylistInput):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Song was removed for being too long")
 
     try:
-        video_info = await asyncio.to_thread(extract_video_info, body.url)
+        video_info = await asyncio.to_thread(lookup_video, body.url, body.url_id)
     except DownloadError as error:
         # Age-restricted videos need a signed-in, age-verified YouTube account, which the server doesn't use.
         if "confirm your age" in str(error):
@@ -244,8 +326,10 @@ async def add_song(body: PlaylistInput):
         "service": body.service,
         "url": body.url,
         "url_id": body.url_id,
-        "url_creator": video_info.get("uploader") or video_info.get("channel"),
-        "youtube_title": video_info.get("title"),
+        # Empty when nothing could look the video up (see lookup_video): the title is then the
+        # song name the singer typed.
+        "url_creator": video_info.get("uploader") or video_info.get("channel") or None,
+        "youtube_title": (video_info.get("title") or body.song_name)[:100],
         "url_channel_icon": channel_icon_url,
         "duration": duration,
         "is_too_long": duration is not None and duration > max_song_length_seconds,
@@ -346,7 +430,7 @@ async def playing_song():
 # about a song that's no longer current is ignored.
 @router.post("/position", dependencies=[Depends(require_admin)])
 async def report_position(body: PlaylistPosition) -> bool:
-    return playlist_store.set_position(body.p_id, body.position)
+    return playlist_store.set_position(body.p_id, body.position, body.duration, max_song_length_seconds)
 
 @router.get("/playback-source", dependencies=[Depends(require_admin)])
 async def playback_source() -> dict[str, str | None]:

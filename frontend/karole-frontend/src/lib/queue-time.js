@@ -19,8 +19,28 @@ export function describeLength(totalSeconds) {
 }
 
 // Some songs (live streams) have no known length; they are counted as zero.
+// A song added when nothing could look the video up has no length (nor do live streams). Time
+// totals count each as this long, and say they're estimates while such a song is still ahead.
+export const UNKNOWN_SONG_SECONDS = 180;
+
+export function songLength(song) {
+    return song?.duration || UNKNOWN_SONG_SECONDS;
+}
+
 export function totalLength(songs) {
-    return songs.reduce((sum, song) => sum + (song.duration || 0), 0);
+    return songs.reduce((sum, song) => sum + songLength(song), 0);
+}
+
+// How many of these songs have no known length (so the totals are estimates).
+export function countUnknownLength(songs) {
+    return songs.filter((song) => !song.duration).length;
+}
+
+// The line saying a total is an estimate, or null when every length is known.
+export function describeUnknownLengths(songs) {
+    const count = countUnknownLength(songs);
+    if (!count) return null;
+    return `estimate: ${count === 1 ? "1 song's length" : `${count} songs' lengths`} unknown, counted as ${UNKNOWN_SONG_SECONDS / 60} min${count === 1 ? "" : " each"}`;
 }
 
 // Notes how far this computer's clock is from the backend's, from a playback state the backend
@@ -70,8 +90,15 @@ function minutesText(minutes) {
 // `upcoming` is from usePlaylist (the current song first, unless the queue has run out),
 // `progress` from /playlist/progress.
 export function describeEstimate(upcoming, progress, nowSeconds, suffix = "") {
+    const text = estimateText(upcoming, progress, nowSeconds, suffix);
+    // Songs with no known length are counted as UNKNOWN_SONG_SECONDS; say so while one is ahead.
+    return countUnknownLength(upcoming) ? `${text} (some lengths estimated)` : text;
+}
+
+function estimateText(upcoming, progress, nowSeconds, suffix) {
     const current = progress && !progress.finished && upcoming[0]?.p_id === progress.p_id ? upcoming[0] : null;
-    const elapsed = current ? songElapsed({ ...progress, song: current }, nowSeconds) : 0;
+    // The current song counts down to 0, never below, even when its length is only a guess.
+    const elapsed = current ? Math.min(songElapsed({ ...progress, song: current }, nowSeconds), songLength(current)) : 0;
     const low = Math.max(0, totalLength(upcoming) - elapsed);
     const lowText = `${describeLength(low)}${suffix}`;
     if (!progress?.pause_before_songs) return lowText;

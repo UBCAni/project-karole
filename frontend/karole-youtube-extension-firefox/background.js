@@ -60,7 +60,7 @@ async function tellYouTube(message) {
         if (desired) {
             const playing = message.type === "play" ? true : message.type === "pause" ? false : desired.playing;
             const start = lastStatus?.videoId === desired.videoId ? lastStatus.time : 0;
-            await loadVideo(desired.videoId, playing, start);
+            await loadVideo(desired.videoId, playing, start, { pId: desired.pId });
         }
     }
     return true;
@@ -74,27 +74,62 @@ function videoInUrl(url) {
     }
 }
 
+// The window follows one Karole site: the one whose player page loaded its song (`desired.origin`,
+// with that page's tab, `desired.driverTabId`). Two copies of the site (say the laptop's own at
+// localhost and the hosted one) have different queues, so following whichever page spoke last made
+// the window flip between them. Another site's pages can only take over once the driving page is
+// closed (or has left the site), or when someone presses Open/Reopen YouTube window there.
+async function driverStillOpen(desired) {
+    if (desired?.driverTabId == null) return false;
+    try {
+        const tab = await browser.tabs.get(desired.driverTabId);
+        return new URL(tab.url).origin === desired.origin;
+    } catch {
+        return false;
+    }
+}
+
+async function isOtherSite(origin) {
+    const { desired } = await browser.storage.session.get("desired");
+    return Boolean(desired?.origin && origin && origin !== desired.origin && (await driverStillOpen(desired)));
+}
+
+const OTHER_SITE = { ok: false, ignored: true, error: "The YouTube window is following another copy of the Karole site" };
+
 // Opens the YouTube window, or reuses it, and points it at a song (pId is its place in the
 // queue). The same song asked for again, say by the player page once it wakes up after the
 // Playlist page already sent it, only gets its play/pause state applied instead of starting over;
 // `force` reloads it anyway. With `onlyIfOpen` no window is opened: opening it is the player
-// page's job. Returns whether the window was pointed at the song.
-async function loadVideo(videoId, playing, start, { pId = null, onlyIfOpen = false, force = false } = {}) {
+// page's job. `origin` is the site the song comes from and `driverTabId` the player page that
+// sent it (see driverStillOpen); both stay as they were when left out. Returns whether the window
+// was pointed at the song.
+async function loadVideo(
+    videoId,
+    playing,
+    start,
+    { pId = null, onlyIfOpen = false, force = false, origin = null, driverTabId = null } = {}
+) {
     const openTab = await getYouTubeTab();
     if (!openTab && onlyIfOpen) return false;
+    const { desired: previous, siteOrigin } = await browser.storage.session.get(["desired", "siteOrigin"]);
+    const songOrigin = origin || previous?.origin || siteOrigin || null;
+    const sameSite = songOrigin === previous?.origin;
+    const driver = driverTabId ?? (sameSite ? previous?.driverTabId ?? null : null);
     if (openTab && !force && pId !== null) {
         const { desired, needsFreshPage } = await browser.storage.session.get(["desired", "needsFreshPage"]);
-        if (!needsFreshPage && desired?.pId === pId && videoInUrl(openTab.url) === videoId) {
+        // The same place in the queue on another site is another song (each site counts its own).
+        if (!needsFreshPage && sameSite && desired?.pId === pId && videoInUrl(openTab.url) === videoId) {
+            if (desired.driverTabId !== driver) await browser.storage.session.set({ desired: { ...desired, driverTabId: driver } });
             if (desired.playing !== playing) {
                 // A real Play or Pause, so the song no longer plays by itself (see autoPlay).
-                await browser.storage.session.set({ desired: { ...desired, playing, autoPlayCancelled: true } });
+                await browser.storage.session.set({ desired: { ...desired, driverTabId: driver, playing, autoPlayCancelled: true } });
                 await tellYouTube({ type: playing ? "play" : "pause", cancelAutoPlay: true });
             }
             return true;
         }
     }
     await browser.storage.session.set({
-        desired: { videoId, pId, playing, start: start || 0 },
+        desired: { videoId, pId, playing, start: start || 0, origin: songOrigin, driverTabId: driver },
         needsFreshPage: false,
         endedPId: null,
     });
@@ -109,12 +144,14 @@ async function loadVideo(videoId, playing, start, { pId = null, onlyIfOpen = fal
     return true;
 }
 
-// The Karole backend, reached through the site that last talked to the extension (its /backend
-// pass-through), with that site's admin login.
+// The Karole backend of the site the window follows (see driverStillOpen), reached through that
+// site's /backend pass-through with its admin login. Before any song, the site that last talked
+// to the extension.
 async function fromBackend(path, options = {}) {
-    const { siteOrigin } = await browser.storage.session.get("siteOrigin");
-    if (!siteOrigin) throw new Error("No Karole page has talked to the extension yet");
-    const response = await fetch(`${siteOrigin}/backend${path}`, { ...options, credentials: "include", cache: "no-store" });
+    const { desired, siteOrigin } = await browser.storage.session.get(["desired", "siteOrigin"]);
+    const origin = desired?.origin || siteOrigin;
+    if (!origin) throw new Error("No Karole page has talked to the extension yet");
+    const response = await fetch(`${origin}/backend${path}`, { ...options, credentials: "include", cache: "no-store" });
     if (!response.ok) throw new Error(`${path} answered ${response.status}`);
     return response.json();
 }
@@ -245,9 +282,16 @@ async function fromSite(message, tab, senderUrl) {
     if (!state.siteTabIds.includes(tab.id)) {
         await browser.storage.session.set({ siteTabIds: [...state.siteTabIds, tab.id] });
     }
-    // Where the backend is: the song-end handling below talks to it through this site.
-    const siteOrigin = senderUrl ? new URL(senderUrl).origin : null;
-    if (siteOrigin) await browser.storage.session.set({ siteOrigin });
+    // The site this page belongs to. It's only where the backend is reached before the window
+    // has a song; after that the window follows the site its song came from (see loadVideo).
+    const origin = senderUrl ? new URL(senderUrl).origin : null;
+    if (origin && !state.desired?.origin) await browser.storage.session.set({ siteOrigin: origin });
+    // Commands for the window from another copy of the site are ignored while the page driving
+    // it is open. Open/Reopen YouTube window ("load" with force) is the deliberate way to move it.
+    const steersWindow = ["load", "play", "pause", "seek", "captions", "settings", "fullscreen", "close"];
+    if (steersWindow.includes(message.type) && !(message.type === "load" && message.force) && (await isOtherSite(origin))) {
+        return OTHER_SITE;
+    }
 
     switch (message.type) {
         case "load":
@@ -257,6 +301,9 @@ async function fromSite(message, tab, senderUrl) {
                     pId: Number.isInteger(message.pId) ? message.pId : null,
                     onlyIfOpen: Boolean(message.onlyIfOpen),
                     force: Boolean(message.force),
+                    origin,
+                    // The player page loads songs itself; the Playlist page only steers an open window.
+                    driverTabId: message.onlyIfOpen ? null : tab.id,
                 }),
             };
         case "play":
@@ -338,7 +385,12 @@ async function fromYouTube(message, tab) {
             await fromBackend("/playlist/position", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ p_id: message.pId, position: Math.max(0, message.time) }),
+                body: JSON.stringify({
+                    p_id: message.pId,
+                    position: Math.max(0, message.time),
+                    // The real length, for a song added without one (not for live streams, which have none).
+                    ...(Number.isFinite(message.duration) && message.duration > 0 ? { duration: message.duration } : {}),
+                }),
             }).catch(() => {});
         }
         return { ok: true };
@@ -395,5 +447,8 @@ browser.tabs.onRemoved.addListener(async (tabId) => {
         await tellSites({ type: "status", status: { state: "closed" } });
     } else if (siteTabIds.includes(tabId)) {
         await browser.storage.session.set({ siteTabIds: siteTabIds.filter((id) => id !== tabId) });
+        // The page driving the window closed: another copy of the site's player page may take over.
+        const { desired } = await browser.storage.session.get("desired");
+        if (desired?.driverTabId === tabId) await browser.storage.session.set({ desired: { ...desired, driverTabId: null } });
     }
 });

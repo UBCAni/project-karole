@@ -37,9 +37,11 @@ developer account.
 
 1. Sign in to YouTube in that Chrome. Age-restricted videos need a signed-in account, and
    YouTube Premium removes ads.
-2. Open the player page at **http://localhost:3000/admin/view**, or at the Tailscale address
+2. Open the player page at the live site, **https://karaoke.ubcani.com/admin/view** (from 1.8.1),
+   or at **http://localhost:3000/admin/view**, or at the Tailscale address
    (https://dhairyas-macbook-pro.tail512d14.ts.net/admin/view). Use `localhost`, not
-   `127.0.0.1`; the extension only works on the addresses listed in `manifest.json`.
+   `127.0.0.1`; the extension only works on the addresses listed in `manifest.json` (add any new
+   address of the site there, in both extensions).
 3. When the page finds the extension, it says "Video plays in the YouTube window", and as soon
    as a song is up it opens a YouTube window showing only the video.
 4. Drag that window onto the karaoke screen and click **Full screen** on the player page to switch it on.
@@ -148,3 +150,16 @@ of the site), the player page uses it to claim the main screen, and every second
 window is open the extension checks that it still is: if another device has taken over, it closes
 its window, even with no Karole page open. The first player page with the extension claims the main
 screen by itself while no device has it.
+
+Since 1.8.2 the window follows one copy of the site only: the one whose player page loaded its
+song. With two copies open on the same computer (say the laptop's own at localhost and the hosted
+https://karaoke.ubcani.com), which have different queues, the window used to follow whichever page
+spoke to the extension last and kept pausing or switching songs. Now the other copy's pages can't
+steer it (their loads, Play/Pause and other commands are ignored) while the driving player page is
+open. To move the window to the other copy on purpose, press "Open/Reopen YouTube window" on that
+copy's player page; closing the driving page also lets the other one take over. Best during an
+event: keep only one copy of the site open on the screen's laptop.
+
+Since 1.8.3 the position reports also carry the song's real length. A song added without one (when
+nothing could look the video up) gets it filled in on the site as soon as it plays, so the time
+totals stop estimating it.

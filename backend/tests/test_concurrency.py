@@ -72,6 +72,7 @@ def fake_video_info(url):
 
 routes.read_queue_settings = fake_settings
 routes.blocked_col = NoBlockedSongs()
+REAL_EXTRACT_VIDEO_INFO = routes.extract_video_info
 routes.extract_video_info = fake_video_info
 routes.extract_channel_icon_url = lambda url: None
 name_module.read_name = fake_read_name
@@ -237,7 +238,180 @@ async def main_test() -> None:
     await position_test()
     await login_cookie_test()
     await main_screen_test()
+    await add_fallback_test()
+    await real_length_test()
     print("\nAll checks passed. Temporary logs were written to", LOG_DIR)
+
+
+async def add_fallback_test() -> None:
+    # Adding a song tries, in turn: yt-dlp, yt-dlp with the cookies file, YouTube's Data API, and
+    # finally nothing (added with the typed song name as its title). Each step is made to fail here.
+    import io
+    import json as json_module
+    import urllib.error
+    from yt_dlp.utils import DownloadError
+
+    real = (routes.extract_video_info, routes.urlopen, routes.YoutubeDL)
+    environment = {key: os.environ.get(key) for key in ("YOUTUBE_API_KEY", "YTDLP_COOKIE_FILE")}
+    api_calls = []
+
+    def refused(url):
+        raise DownloadError("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+
+    def age_restricted(url):
+        raise DownloadError("ERROR: [youtube] x: Sign in to confirm your age")
+
+    def api_answers(payload):
+        def fake_urlopen(request, timeout=None):
+            api_calls.append(request.full_url)
+            if isinstance(payload, Exception):
+                raise payload
+            return io.BytesIO(json_module.dumps(payload).encode())
+        return fake_urlopen
+
+    def api_item(rating=None):
+        details = {"duration": "PT3M25S"}
+        if rating:
+            details["contentRating"] = {"ytRating": rating}
+        return {"items": [{"snippet": {"title": "From the API", "channelTitle": "API channel", "channelId": "UCabc"},
+                           "contentDetails": details}]}
+
+    def body(video_id, song_name="Typed song name"):
+        return {"url": f"https://www.youtube.com/watch?v={video_id}", "name": "Alex", "song_name": song_name}
+
+    def added(store, video_id):
+        return [song for song in store.songs if song.url_id == video_id]
+
+    try:
+        print("Reading the API's lengths")
+        check(routes.parse_iso_duration("PT3M25S") == 205 and routes.parse_iso_duration("PT1H2M5S") == 3725
+              and routes.parse_iso_duration("PT45S") == 45 and routes.parse_iso_duration("P1DT1S") == 86401,
+              "PT3M25S, PT1H2M5S, PT45S and P1DT1S are read right")
+        check(routes.parse_iso_duration("P0D") is None and routes.parse_iso_duration(None) is None
+              and routes.parse_iso_duration("nonsense") is None, "a live stream (P0D) or nonsense has no length")
+
+        print("Step 2: yt-dlp again with the cookies file")
+        cookie_file = os.path.join(LOG_DIR, "cookies.txt")
+        open(cookie_file, "w").close()
+        os.environ["YTDLP_COOKIE_FILE"] = cookie_file
+        attempts = []
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = options
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=False):
+                attempts.append("cookies" if self.options.get("cookiefile") else "plain")
+                if not self.options.get("cookiefile"):
+                    raise DownloadError("ERROR: Sign in to confirm you're not a bot")
+                return {"title": "With cookies", "duration": 100, "uploader": "Cookie channel"}
+
+        routes.YoutubeDL = FakeYoutubeDL
+        info = REAL_EXTRACT_VIDEO_INFO("https://www.youtube.com/watch?v=cookieVid01")
+        check(attempts == ["plain", "cookies"] and info["title"] == "With cookies", "a refused lookup is retried with the cookies")
+        routes.YoutubeDL = real[2]
+        os.environ.pop("YTDLP_COOKIE_FILE")
+
+        transport = httpx.ASGITransport(app=main.app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            print("Step 1: yt-dlp answers")
+            store = fresh_queue()
+            routes.extract_video_info = lambda url: {"title": "From yt-dlp", "duration": 200, "uploader": "Channel"}
+            os.environ["YOUTUBE_API_KEY"] = "test-key"
+            routes.urlopen = api_answers(api_item())
+            api_calls.clear()
+            answer = await client.post("/playlist/add", json=body("stepOneVid1"))
+            check(answer.status_code == 200 and added(store, "stepOneVid1")[0].youtube_title == "From yt-dlp" and not api_calls,
+                  "added from yt-dlp, and the API isn't used")
+
+            print("Step 3: YouTube's Data API")
+            routes.extract_video_info = refused
+            answer = await client.post("/playlist/add", json=body("stepThreeV1"))
+            song = added(store, "stepThreeV1")
+            check(answer.status_code == 200 and len(song) == 1, "yt-dlp refused: added from the API")
+            check(song[0].youtube_title == "From the API" and song[0].url_creator == "API channel" and song[0].duration == 205,
+                  "with the API's title, channel and length (3:25)")
+            check(len(api_calls) >= 1 and "id=stepThreeV1" in api_calls[0] and "part=snippet%2CcontentDetails" in api_calls[0],
+                  "one videos.list request for that ID")
+
+            routes.urlopen = api_answers({"items": []})
+            answer = await client.post("/playlist/add", json=body("missingVid1"))
+            check(answer.status_code >= 500 and not added(store, "missingVid1"),
+                  "a video the API says doesn't exist isn't added (the usual 'couldn't look up' message)")
+
+            routes.urlopen = api_answers(api_item(rating="ytAgeRestricted"))
+            answer = await client.post("/playlist/add", json=body("ageApiVid01"))
+            check(answer.status_code == 400 and answer.json()["detail"] == "Video is age-restricted" and not added(store, "ageApiVid01"),
+                  "an age-restricted video (said by the API) gets the age-restricted message")
+
+            routes.extract_video_info = age_restricted
+            api_calls.clear()
+            answer = await client.post("/playlist/add", json=body("ageYtdlp001"))
+            check(answer.status_code == 400 and not api_calls, "age-restricted from yt-dlp isn't retried with the API")
+
+            print("Step 4: nothing could look it up")
+            routes.extract_video_info = refused
+            routes.urlopen = api_answers(urllib.error.HTTPError("https://example", 403, "quotaExceeded", {}, None))
+            answer = await client.post("/playlist/add", json=body("nullStepV01", "Gurenge"))
+            song = added(store, "nullStepV01")
+            check(answer.status_code == 200 and len(song) == 1, "the API can't answer (quota used up): added anyway")
+            check(song[0].youtube_title == "Gurenge" and song[0].url_creator is None and song[0].duration is None
+                  and song[0].url_channel_icon is None and song[0].is_too_long is False,
+                  "with the typed song name as its title, and no channel, icon or length")
+
+            os.environ.pop("YOUTUBE_API_KEY")
+            api_calls.clear()
+            answer = await client.post("/playlist/add", json=body("noKeyVid001"))
+            check(answer.status_code == 200 and not api_calls and added(store, "noKeyVid001"),
+                  "with no API key, the API step is skipped and it's added the same way")
+
+            answer = await client.post("/playlist/add", json=body("nullStepV01"))
+            check(answer.status_code == 400, "the duplicate check still applies")
+            check((await client.get("/playlist/progress")).status_code == 200 and (await client.get("/playlist/")).status_code == 200,
+                  "the queue and progress still load with those songs in it")
+            each_song_once(store, 10)
+    finally:
+        routes.extract_video_info, routes.urlopen, routes.YoutubeDL = real
+        for key, value in environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+async def real_length_test() -> None:
+    # A song added without a length gets its real one from the YouTube window once it plays.
+    from playlist.playlist_store import read_snapshot, songs_from_snapshot, read_log
+
+    print("Filling in the real length when a song with no length plays")
+    store = fresh_queue(song_count=3)
+    store.songs[0].duration = None
+    store.songs[1].duration = None
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        answer = await client.post("/playlist/position", json={"p_id": 0, "position": 5, "duration": 205})
+        check(answer.json() is True and store.songs[0].duration == 205, "the window's length is saved for the playing song")
+        await client.post("/playlist/position", json={"p_id": 0, "position": 9, "duration": 999})
+        check(store.songs[0].duration == 205, "a known length is never overwritten")
+        await client.post("/playlist/position", json={"p_id": 1, "position": 3, "duration": 150})
+        check(store.songs[1].duration is None, "a report about a song that isn't playing is ignored")
+        await client.post("/playlist/position", json={"p_id": 0, "position": 12})
+        check(store.songs[0].duration == 205, "a report without a length (older extension) changes nothing")
+        check(store.songs[0].is_too_long is False, "a normal length isn't flagged")
+        line = read_log(store.log_path)[-1][0]
+        restored = songs_from_snapshot(read_snapshot(store.log_path, line))
+        check(restored[0].duration == 205, "the session log keeps it, so Restore does too")
+
+        await client.post("/playlist/skip?from_p_id=0")
+        answer = await client.post("/playlist/position", json={"p_id": 1, "position": 1, "duration": 900})
+        check(store.songs[1].duration == 900 and store.songs[1].is_too_long is True,
+              "a real length over the limit is flagged as too long")
+        check(store.current_song.p_id == 1 and store.playing is True, "and it keeps playing")
+        answer = await client.post("/playlist/position", json={"p_id": 1, "position": 1, "duration": 0})
+        check(answer.status_code == 422, "a zero length is refused")
 
 
 class FakeSettingsCollection:
