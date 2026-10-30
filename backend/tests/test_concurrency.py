@@ -244,8 +244,9 @@ async def main_test() -> None:
 
 
 async def add_fallback_test() -> None:
-    # Adding a song tries, in turn: yt-dlp, yt-dlp with the cookies file, YouTube's Data API, and
-    # finally nothing (added with the typed song name as its title). Each step is made to fail here.
+    # Adding a song tries, in turn: yt-dlp, yt-dlp with the cookies file, yt-dlp's answer with no
+    # length, YouTube's Data API, and finally nothing (added with the typed song name as its title).
+    # Each step is made to fail here.
     import io
     import json as json_module
     import urllib.error
@@ -312,8 +313,39 @@ async def add_fallback_test() -> None:
         routes.YoutubeDL = FakeYoutubeDL
         info = REAL_EXTRACT_VIDEO_INFO("https://www.youtube.com/watch?v=cookieVid01")
         check(attempts == ["plain", "cookies"] and info["title"] == "With cookies", "a refused lookup is retried with the cookies")
-        routes.YoutubeDL = real[2]
+
+        # YouTube's "not a bot" refusal is hidden by ignore_no_formats_error: the answer has the
+        # title and channel but no length.
+        answers = {"plain": {"title": "From the page", "uploader": "Page channel"}}
+
+        class NoLengthYoutubeDL(FakeYoutubeDL):
+            def extract_info(self, url, download=False):
+                step = "cookies" if self.options.get("cookiefile") else "plain"
+                attempts.append(step)
+                if step not in answers:
+                    raise DownloadError("ERROR: Sign in to confirm you're not a bot")
+                return answers[step]
+
+        routes.YoutubeDL = NoLengthYoutubeDL
+        answers["cookies"] = {"title": "With cookies", "duration": 213, "uploader": "Cookie channel"}
+        attempts.clear()
+        info = REAL_EXTRACT_VIDEO_INFO("https://www.youtube.com/watch?v=noLength001")
+        check(attempts == ["plain", "cookies"] and info["duration"] == 213, "an answer with no length is retried with the cookies")
+        answers.pop("cookies")
+        attempts.clear()
+        info = REAL_EXTRACT_VIDEO_INFO("https://www.youtube.com/watch?v=noLength001")
+        check(attempts == ["plain", "cookies"] and info["title"] == "From the page" and not info.get("duration"),
+              "cookies refused: the first answer (title, no length) is kept")
+        answers["plain"] = {"title": "Live now", "uploader": "Channel", "is_live": True}
+        attempts.clear()
+        REAL_EXTRACT_VIDEO_INFO("https://www.youtube.com/watch?v=liveStream1")
+        check(attempts == ["plain"], "a live stream (no length anyway) isn't retried")
         os.environ.pop("YTDLP_COOKIE_FILE")
+        answers["plain"] = {"title": "From the page", "uploader": "Page channel"}
+        attempts.clear()
+        info = REAL_EXTRACT_VIDEO_INFO("https://www.youtube.com/watch?v=noLength001")
+        check(attempts == ["plain"] and info["title"] == "From the page", "no cookies file: the answer with no length is kept")
+        routes.YoutubeDL = real[2]
 
         transport = httpx.ASGITransport(app=main.app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -327,7 +359,18 @@ async def add_fallback_test() -> None:
             check(answer.status_code == 200 and added(store, "stepOneVid1")[0].youtube_title == "From yt-dlp" and not api_calls,
                   "added from yt-dlp, and the API isn't used")
 
-            print("Step 3: YouTube's Data API")
+            print("Step 3: yt-dlp gets the title but no length (YouTube's hidden 'not a bot' refusal)")
+            routes.extract_video_info = lambda url: {"title": "From the page", "uploader": "Page channel"}
+            routes.urlopen = api_answers(api_item())
+            api_calls.clear()
+            answer = await client.post("/playlist/add", json=body("pageOnly001", "Gurenge"))
+            song = added(store, "pageOnly001")
+            check(answer.status_code == 200 and song[0].youtube_title == "From the page" and song[0].url_creator == "Page channel"
+                  and song[0].duration is None and song[0].is_too_long is False,
+                  "added with yt-dlp's title and channel, and no length")
+            check(not api_calls, "the API isn't asked")
+
+            print("Step 4: YouTube's Data API")
             routes.extract_video_info = refused
             answer = await client.post("/playlist/add", json=body("stepThreeV1"))
             song = added(store, "stepThreeV1")
@@ -352,7 +395,7 @@ async def add_fallback_test() -> None:
             answer = await client.post("/playlist/add", json=body("ageYtdlp001"))
             check(answer.status_code == 400 and not api_calls, "age-restricted from yt-dlp isn't retried with the API")
 
-            print("Step 4: nothing could look it up")
+            print("Step 5: nothing could look it up")
             routes.extract_video_info = refused
             routes.urlopen = api_answers(urllib.error.HTTPError("https://example", 403, "quotaExceeded", {}, None))
             answer = await client.post("/playlist/add", json=body("nullStepV01", "Gurenge"))
@@ -372,7 +415,7 @@ async def add_fallback_test() -> None:
             check(answer.status_code == 400, "the duplicate check still applies")
             check((await client.get("/playlist/progress")).status_code == 200 and (await client.get("/playlist/")).status_code == 200,
                   "the queue and progress still load with those songs in it")
-            each_song_once(store, 10)
+            each_song_once(store, 11)
     finally:
         routes.extract_video_info, routes.urlopen, routes.YoutubeDL = real
         for key, value in environment.items():
