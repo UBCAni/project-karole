@@ -19,7 +19,7 @@ import re
 import json
 import os
 import time
-from typing import Any, cast
+from typing import Any, Callable, cast
 from html.parser import HTMLParser
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
@@ -54,7 +54,15 @@ def extract_video_info(url: str) -> dict:
     # Adding a song only needs its title, length and channel, never a playable file. YouTube often
     # hides the files from servers, which would otherwise fail the whole lookup.
     options["ignore_no_formats_error"] = True
-    return _extract_info_with_auth_fallback(url, options)
+    # That option also hides YouTube's "confirm you're not a bot" refusal: the answer then has the
+    # title and channel (read from the page) but no length. So an answer with no length counts as
+    # refused, and the cookies are tried; if they don't get the length either, it's kept as it is.
+    return _extract_info_with_auth_fallback(url, options, complete=has_length)
+
+
+def has_length(info: dict) -> bool:
+    # Live streams have no length, so asking again wouldn't get one.
+    return bool(info.get("duration")) or bool(info.get("is_live")) or info.get("live_status") in ("is_live", "is_upcoming")
 
 class VideoNotFound(Exception):
     """YouTube's API says there's no video with that ID (a mistyped link, or it was removed)."""
@@ -112,23 +120,32 @@ def lookup_with_api(video_id: str) -> dict | None:
 
 def lookup_video(url: str, video_id: str) -> dict:
     # The details for a song being added, trying in turn: yt-dlp, yt-dlp again with the cookies file
-    # (YTDLP_COOKIE_FILE, only if set; both in extract_video_info), YouTube's Data API (only with
-    # YOUTUBE_API_KEY), and finally nothing: an empty dict, so the song is added with the name the
-    # singer typed as its title and no channel or length (the YouTube window plays it by its ID
-    # anyway). Raises DownloadError for a video that doesn't exist or is age-restricted.
+    # (YTDLP_COOKIE_FILE, only if set), then yt-dlp's answer with no length (both refused, but it
+    # still read the title and channel from the page; all three in extract_video_info), YouTube's
+    # Data API (only with YOUTUBE_API_KEY), and finally nothing: an empty dict, so the song is added
+    # with the name the singer typed as its title and no channel or length (the YouTube window plays
+    # it by its ID anyway, and reports its length). Raises DownloadError for a video that doesn't
+    # exist or is age-restricted.
     try:
-        return extract_video_info(url)
+        info = extract_video_info(url)
     except DownloadError as error:
         # Age-restricted videos need a signed-in, age-verified account; nothing below helps.
         if "confirm your age" in str(error):
             raise
         failure = error
+    else:
+        print(f"Song lookup {video_id}: found by yt-dlp{'' if has_length(info) else ', but YouTube refused its length'}", flush=True)
+        return info
     try:
         details = lookup_with_api(video_id)
     except VideoNotFound:
         raise failure from None
     except VideoAgeRestricted:
         raise DownloadError("ERROR: Sign in to confirm your age (YouTube Data API)") from None
+    if details:
+        print(f"Song lookup {video_id}: found by YouTube's API", flush=True)
+    else:
+        print(f"Song lookup {video_id}: nothing could look it up, added with the typed name", flush=True)
     return details or {}
 
 
@@ -163,17 +180,32 @@ def _yt_dlp_options() -> dict:
         "noplaylist": True,
     }
 
-def _extract_info_with_auth_fallback(url: str, options: dict) -> dict:
+def _extract_info_with_auth_fallback(url: str, options: dict, complete: Callable[[dict], bool] | None = None) -> dict:
+    # Retried with the cookies file (YTDLP_COOKIE_FILE, only if set) when YouTube refuses. With
+    # complete, an answer it says is missing something counts as refused too, and is kept if the
+    # cookies are refused.
+    first_answer, refusal = None, None
     try:
         with YoutubeDL(cast(Any, options)) as downloader:
-            return cast(dict, downloader.extract_info(url, download=False))
-    except DownloadError:
-        cookie_file = os.getenv("YTDLP_COOKIE_FILE")
-        if not cookie_file or not os.path.isfile(cookie_file) or options.get("cookiefile") == cookie_file:
-            raise
-        authenticated_options = {**options, "cookiefile": cookie_file}
+            first_answer = cast(dict, downloader.extract_info(url, download=False))
+        if complete is None or complete(first_answer):
+            return first_answer
+    except DownloadError as error:
+        refusal = error
+    cookie_file = os.getenv("YTDLP_COOKIE_FILE")
+    if not cookie_file or not os.path.isfile(cookie_file) or options.get("cookiefile") == cookie_file:
+        if refusal is not None:
+            raise refusal
+        return cast(dict, first_answer)
+    authenticated_options = {**options, "cookiefile": cookie_file}
+    print(f"yt-dlp: YouTube refused {url}, trying again with the cookies file", flush=True)
+    try:
         with YoutubeDL(cast(Any, authenticated_options)) as downloader:
             return cast(dict, downloader.extract_info(url, download=False))
+    except DownloadError:
+        if first_answer is None:
+            raise
+        return first_answer
 
 class ChannelIconParser(HTMLParser):
     def __init__(self):
