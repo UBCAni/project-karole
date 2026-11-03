@@ -14,8 +14,8 @@ const body = Figtree({
 });
 
 export const metadata = {
-  title: "UBCANI Kareoke",
-  description: "Kareoke Manager!",
+  title: "UBCANI Karaoke",
+  description: "Karaoke Manager!",
 };
 
 export const viewport = {
