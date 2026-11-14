@@ -10,12 +10,20 @@
     "sample-backend": "node scripts/sample-backend.mjs"
   },
   "dependencies": {
-    "next": "16.3.5",
+    "next": "^16.4.6",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
     "eslint": "^9",
     "eslint-config-next": "16.3.5"
+  },
+  "allowScripts": {
+    "unrs-resolver@1.12.2": true
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "11.0.8"
+    }
   }
 }
